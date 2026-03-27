@@ -1,9 +1,5 @@
 import argparse
 import csv
-import os
-import re
-import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +17,8 @@ CONF_THRESHOLD = 0.4
 IOU_MATCH_THRESHOLD = 0.2
 MAX_MISSED_SAMPLES = 2
 MIN_TRACK_HITS = 2
+MIN_RELIABLE_FILL = 5.0
+MAX_SELECTION_CANDIDATES = 7
 
 
 @dataclass
@@ -31,6 +29,9 @@ class Detection:
     frame_index: int
     timestamp_sec: float
     image_path: Path
+    fill_percentage: float | None = None
+    fill_status: str = "pending"
+    raw_output: str = ""
 
 
 @dataclass
@@ -65,6 +66,16 @@ def parse_args():
         "--no-preview",
         action="store_true",
         help="Disable the live detection preview window",
+    )
+    parser.add_argument(
+        "--write-all-frame-csv",
+        action="store_true",
+        help="Write fill results for every sampled frame in the accepted truck tracks",
+    )
+    parser.add_argument(
+        "--write-summary-csv",
+        action="store_true",
+        help="Write the selected-frame summary CSV",
     )
     return parser.parse_args()
 
@@ -159,6 +170,41 @@ def resize_mask(mask, target_shape):
     ).astype(bool)
 
 
+def calculate_fill_percentage(box_mask, content_mask):
+    content_mask = content_mask & box_mask
+
+    kernel = np.ones((5, 5), np.uint8)
+    content_mask = cv2.morphologyEx(
+        content_mask.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        kernel,
+    ).astype(bool)
+
+    box_rows = np.any(box_mask, axis=1)
+    content_rows = np.any(content_mask, axis=1)
+
+    if not np.any(box_rows):
+        return 0.0
+
+    box_top = np.argmax(box_rows)
+    box_bottom = len(box_rows) - 1 - np.argmax(box_rows[::-1])
+
+    if not np.any(content_rows):
+        return 0.0
+
+    content_top = np.argmax(content_rows)
+    content_top = max(content_top, box_top)
+
+    box_height = box_bottom - box_top
+    content_height = box_bottom - content_top
+
+    if box_height <= 0:
+        return 0.0
+
+    fill = (content_height / box_height) * 100
+    return max(0.0, min(fill, 100.0))
+
+
 def apply_segmentation_overlay(frame, bbox, size_model, size_classes, device):
     x1, y1, x2, y2 = bbox
     truck_crop = frame[y1:y2, x1:x2]
@@ -222,13 +268,12 @@ def save_frame(output_dir, track_id, frame_index, frame):
     return image_path
 
 
-def resize_for_display(image, max_width=1280, max_height=720):
-    height, width = image.shape[:2]
-    scale = min(max_width / width, max_height / height, 1.0)
-    if scale == 1.0:
-        return image
+PREVIEW_WINDOW_NAME = "Truck Detection Preview"
 
-    new_size = (int(width * scale), int(height * scale))
+
+def resize_for_display(image, scale=0.25):
+    height, width = image.shape[:2]
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
     return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
 
 
@@ -283,31 +328,140 @@ def match_tracks(active_tracks, detections):
     return matches, unmatched_track_ids, unmatched_detection_ids
 
 
-def run_fill_script(image_path):
-    env = os.environ.copy()
-    env["YOLO_NO_DISPLAY"] = "1"
-    command = [sys.executable, str(FILL_SCRIPT_PATH), str(image_path)]
-    completed = subprocess.run(
-        command,
-        cwd=str(BASE_DIR),
-        capture_output=True,
-        text=True,
-        env=env,
-        check=False,
-    )
+def estimate_fill_for_frame(frame, truck_model, size_model, truck_classes, size_classes, device):
+    all_fills = []
+    results = truck_model(frame, device=device, verbose=False)[0]
 
-    output = completed.stdout + completed.stderr
-    match = re.search(r"FINAL FILL:\s*([0-9]+(?:\.[0-9]+)?)%", output)
-    fill_percentage = float(match.group(1)) if match else None
-    return completed.returncode, fill_percentage, output
+    for det in results.boxes:
+        confidence = float(det.conf[0])
+        if confidence < CONF_THRESHOLD:
+            continue
+
+        class_id = int(det.cls[0])
+        if truck_classes[class_id] != "truck":
+            continue
+
+        x1, y1, x2, y2 = map(int, det.xyxy[0])
+        truck_crop = frame[y1:y2, x1:x2]
+        if truck_crop.size == 0:
+            continue
+
+        seg_result = size_model(truck_crop, device=device, verbose=False)[0]
+        if seg_result.masks is None:
+            continue
+
+        truck_box_mask = None
+        content_mask = None
+        masks = seg_result.masks.data.cpu().numpy()
+        classes = seg_result.boxes.cls.cpu().numpy()
+
+        for index, cls in enumerate(classes):
+            class_name = size_classes[int(cls)]
+            if class_name.lower() == "box":
+                truck_box_mask = masks[index]
+            elif class_name.lower() == "content":
+                content_mask = masks[index]
+
+        if truck_box_mask is None:
+            continue
+
+        box_mask_resized = resize_mask(truck_box_mask, truck_crop.shape)
+        if content_mask is not None:
+            content_mask_resized = resize_mask(content_mask, truck_crop.shape)
+            fill_percentage = calculate_fill_percentage(box_mask_resized, content_mask_resized)
+        else:
+            fill_percentage = 0.0
+
+        all_fills.append(fill_percentage)
+
+    if not all_fills:
+        return None, "No fill detected"
+
+    avg_fill = sum(all_fills) / len(all_fills)
+    return avg_fill, f"FINAL FILL: {avg_fill:.2f}%"
 
 
-def analyze_video(video_path, output_dir, sampling_fps, show_preview):
+def select_fill_candidates(track):
+    ordered_by_score = sorted(track.history, key=lambda detection: detection.score, reverse=True)
+    score_candidates = ordered_by_score[:MAX_SELECTION_CANDIDATES]
+
+    midpoint_detection = track.history[len(track.history) // 2]
+    midpoint_candidates = sorted(
+        track.history,
+        key=lambda detection: abs(detection.timestamp_sec - midpoint_detection.timestamp_sec),
+    )[:3]
+
+    merged = {}
+    for detection in score_candidates + midpoint_candidates:
+        merged[detection.image_path] = detection
+
+    return sorted(merged.values(), key=lambda detection: detection.frame_index)
+
+
+def evaluate_track_detections(detections, truck_model, size_model, truck_classes, size_classes, device):
+    for detection in detections:
+        frame = cv2.imread(str(detection.image_path))
+        if frame is None:
+            detection.fill_percentage = None
+            detection.raw_output = "Error loading image"
+            detection.fill_status = "failed"
+            continue
+
+        fill_percentage, raw_output = estimate_fill_for_frame(
+            frame,
+            truck_model,
+            size_model,
+            truck_classes,
+            size_classes,
+            device,
+        )
+        detection.fill_percentage = fill_percentage
+        detection.raw_output = raw_output
+        detection.fill_status = "ok" if fill_percentage is not None else "failed"
+
+
+def select_best_detection(track):
+    valid_detections = [detection for detection in track.history if detection.fill_status == "ok"]
+    positive_detections = [
+        detection
+        for detection in valid_detections
+        if detection.fill_percentage is not None and detection.fill_percentage >= MIN_RELIABLE_FILL
+    ]
+
+    if len(positive_detections) >= 2:
+        positive_values = sorted(
+            detection.fill_percentage for detection in positive_detections if detection.fill_percentage is not None
+        )
+        median_fill = positive_values[len(positive_values) // 2]
+        midpoint_time = track.history[len(track.history) // 2].timestamp_sec
+        return min(
+            positive_detections,
+            key=lambda detection: (
+                abs((detection.fill_percentage or 0.0) - median_fill),
+                abs(detection.timestamp_sec - midpoint_time),
+                -detection.score,
+            ),
+        )
+
+    if positive_detections:
+        return max(positive_detections, key=lambda detection: detection.score)
+
+    if valid_detections:
+        return max(valid_detections, key=lambda detection: detection.score)
+
+    return max(track.history, key=lambda detection: detection.score)
+
+
+def load_models():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     truck_model = YOLO(str(TRUCK_MODEL_PATH))
     size_model = YOLO(str(SIZE_MODEL_PATH))
     truck_classes = truck_model.names
     size_classes = size_model.names
+    return device, truck_model, size_model, truck_classes, size_classes
+
+
+def analyze_video(video_path, output_dir, sampling_fps, show_preview, device, truck_model, size_model, truck_classes, size_classes):
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -369,7 +523,9 @@ def analyze_video(video_path, output_dir, sampling_fps, show_preview):
 
         if show_preview:
             preview = draw_preview(frame, active_tracks, frame_index, size_model, size_classes, device)
-            cv2.imshow("Truck Detection Preview", preview)
+            cv2.namedWindow(PREVIEW_WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(PREVIEW_WINDOW_NAME, preview.shape[1], preview.shape[0])
+            cv2.imshow(PREVIEW_WINDOW_NAME, preview)
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
@@ -425,8 +581,6 @@ def write_all_frames_fill_csv(output_dir, completed_tracks):
         for track in sorted(completed_tracks, key=lambda item: item.track_id):
             best_frame_path = str(track.best_detection.image_path)
             for detection in sorted(track.history, key=lambda item: item.frame_index):
-                return_code, fill_percentage, _ = run_fill_script(detection.image_path)
-                status = "ok" if return_code == 0 and fill_percentage is not None else "failed"
                 writer.writerow(
                     {
                         "truck_id": track.track_id,
@@ -434,8 +588,8 @@ def write_all_frames_fill_csv(output_dir, completed_tracks):
                         "timestamp_sec": f"{detection.timestamp_sec:.2f}",
                         "frame_path": str(detection.image_path),
                         "is_selected_frame": "yes" if str(detection.image_path) == best_frame_path else "no",
-                        "fill_percentage": "" if fill_percentage is None else f"{fill_percentage:.2f}",
-                        "status": status,
+                        "fill_percentage": "" if detection.fill_percentage is None else f"{detection.fill_percentage:.2f}",
+                        "status": detection.fill_status,
                     }
                 )
 
@@ -451,17 +605,41 @@ def main():
     output_dir = args.output_dir or (BASE_DIR / "auto_outputs" / video_path.stem)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    completed_tracks = analyze_video(video_path, output_dir, args.fps, not args.no_preview)
+    device, truck_model, size_model, truck_classes, size_classes = load_models()
+    completed_tracks = analyze_video(
+        video_path,
+        output_dir,
+        args.fps,
+        not args.no_preview,
+        device,
+        truck_model,
+        size_model,
+        truck_classes,
+        size_classes,
+    )
     if not completed_tracks:
         print("No truck tracks found.")
         return
 
     summary_rows = []
 
+    for track in completed_tracks:
+        candidate_detections = select_fill_candidates(track)
+        evaluate_track_detections(
+            candidate_detections,
+            truck_model,
+            size_model,
+            truck_classes,
+            size_classes,
+            device,
+        )
+        track.best_detection = select_best_detection(track)
+
     for track in sorted(completed_tracks, key=lambda item: item.track_id):
         best = track.best_detection
-        return_code, fill_percentage, raw_output = run_fill_script(best.image_path)
-        status = "ok" if return_code == 0 and fill_percentage is not None else "failed"
+        fill_percentage = best.fill_percentage
+        raw_output = best.raw_output
+        status = best.fill_status
         summary_rows.append(
             {
                 "truck_id": track.track_id,
@@ -480,11 +658,25 @@ def main():
         log_path = output_dir / f"truck_{track.track_id:03d}_fill_output.txt"
         log_path.write_text(raw_output, encoding="utf-8")
 
-    summary_path = write_summary(output_dir, summary_rows)
-    all_frames_csv_path = write_all_frames_fill_csv(output_dir, completed_tracks)
     print("##########################")
-    print(f"Summary written to: {summary_path}")
-    print(f"All-frame CSV written to: {all_frames_csv_path}")
+
+    if args.write_summary_csv:
+        summary_path = write_summary(output_dir, summary_rows)
+        print(f"Summary CSV written to: {summary_path}")
+
+    if args.write_all_frame_csv:
+        for track in completed_tracks:
+            unevaluated = [detection for detection in track.history if detection.fill_status == "pending"]
+            evaluate_track_detections(
+                unevaluated,
+                truck_model,
+                size_model,
+                truck_classes,
+                size_classes,
+                device,
+            )
+        all_frames_csv_path = write_all_frames_fill_csv(output_dir, completed_tracks)
+        print(f"All-frame CSV written to: {all_frames_csv_path}")
 
 
 if __name__ == "__main__":
