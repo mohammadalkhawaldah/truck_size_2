@@ -1,6 +1,9 @@
 import cv2
 import torch
+import sys
+import os
 import numpy as np
+from pathlib import Path
 from ultralytics import YOLO
 
 
@@ -13,6 +16,29 @@ def resize_mask(mask, target_shape):
         (target_shape[1], target_shape[0]),
         interpolation=cv2.INTER_NEAREST
     ).astype(bool)
+
+
+def resize_for_display(image, max_width=960, max_height=540):
+    height, width = image.shape[:2]
+    scale = min(max_width / width, max_height / height, 1.0)
+
+    if scale == 1.0:
+        return image
+
+    new_size = (int(width * scale), int(height * scale))
+    return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+
+
+def load_frame(input_path):
+    video_extensions = {".mp4", ".avi", ".mov", ".mkv", ".wmv"}
+
+    if input_path.suffix.lower() in video_extensions:
+        cap = cv2.VideoCapture(str(input_path))
+        success, frame = cap.read()
+        cap.release()
+        return frame if success else None
+
+    return cv2.imread(str(input_path))
 
 
 # ============================
@@ -62,8 +88,10 @@ def calculate_fill_percentage(box_mask, content_mask):
 # ============================
 # Load models
 # ============================
-truck_model = YOLO("../Yolo-wight/truck.pt")
-size_model = YOLO(r"../Yolo-wight/sizev2.pt")
+BASE_DIR = Path(__file__).resolve().parent
+
+truck_model = YOLO(str(BASE_DIR / "Yolo-wight" / "truck.pt"))
+size_model = YOLO(str(BASE_DIR / "Yolo-wight" / "best_size_March_25.pt"))
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print("Using device:", device)
@@ -74,13 +102,16 @@ size_classes = size_model.names
 print("Segmentation classes:", size_classes)
 
 CONF_THRESHOLD = 0.4
+SHOW_RESULT = os.environ.get("YOLO_NO_DISPLAY") != "1"
+SAVE_RESULT = os.environ.get("YOLO_NO_SAVE") != "1"
 
 
 # ============================
 # Load IMAGE
 # ============================
-image_path = "baselinevid/imag_68.jpg"
-frame = cv2.imread(image_path)
+default_image_path = BASE_DIR / "baselinevid" / "imag_68.jpg"
+image_path = Path(sys.argv[1]) if len(sys.argv) > 1 else default_image_path
+frame = load_frame(image_path)
 
 if frame is None:
     print("Error loading image")
@@ -203,9 +234,13 @@ print("==============================")
 # ============================
 # Show + Save result
 # ============================
-cv2.imshow("Result", frame)
-cv2.waitKey(0)
+if SHOW_RESULT:
+    display_frame = resize_for_display(frame)
+    cv2.imshow("Result", display_frame)
+    cv2.waitKey(0)
 
-cv2.imwrite("result.jpg", frame)
+if SAVE_RESULT:
+    cv2.imwrite(str(BASE_DIR / "result.jpg"), frame)
 
-cv2.destroyAllWindows()
+if SHOW_RESULT:
+    cv2.destroyAllWindows()
