@@ -19,7 +19,6 @@ The project is designed for fixed-camera scenes where trucks enter the frame, pa
 - [requirements.txt](/c:/Users/moham/OneDrive/Documents/truck_size_2/estimation_size_yolo/requirements.txt)
 - [truck.pt](/c:/Users/moham/OneDrive/Documents/truck_size_2/estimation_size_yolo/Yolo-wight/truck.pt)
 - [best_size_March_25.pt](/c:/Users/moham/OneDrive/Documents/truck_size_2/estimation_size_yolo/Yolo-wight/best_size_March_25.pt)
-- [sizev2.pt](/c:/Users/moham/OneDrive/Documents/truck_size_2/estimation_size_yolo/Yolo-wight/sizev2.pt)
 
 ## Models Used
 
@@ -49,12 +48,6 @@ Purpose:
 - segment the truck load/material area as `content`
 
 This is the default segmentation model for all current runs.
-
-Older model still present in the repo:
-
-- [sizev2.pt](/c:/Users/moham/OneDrive/Documents/truck_size_2/estimation_size_yolo/Yolo-wight/sizev2.pt)
-
-It is kept in the repository, but it is no longer the default runtime model.
 
 ## High-Level Pipeline
 
@@ -587,4 +580,3 @@ Defined in [requirements.txt](/c:/Users/moham/OneDrive/Documents/truck_size_2/es
 - add a pure-library shared inference module so single-image and video code paths share more code directly
 - add configurable class names from a config file instead of hardcoded `box` and `content`
 - add a confidence-based stability score for segmentation output across adjacent frames
-
