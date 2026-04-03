@@ -28,7 +28,7 @@ class Detection:
     score: float
     frame_index: int
     timestamp_sec: float
-    image_path: Path
+    image_path: Path | None = None
     fill_percentage: float | None = None
     fill_status: str = "pending"
     raw_output: str = ""
@@ -268,6 +268,21 @@ def save_frame(output_dir, track_id, frame_index, frame):
     return image_path
 
 
+def load_frame_at(video_path, frame_index):
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return None
+
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        success, frame = cap.read()
+        if not success:
+            return None
+        return frame
+    finally:
+        cap.release()
+
+
 PREVIEW_WINDOW_NAME = "Truck Detection Preview"
 
 
@@ -393,17 +408,17 @@ def select_fill_candidates(track):
 
     merged = {}
     for detection in score_candidates + midpoint_candidates:
-        merged[detection.image_path] = detection
+        merged[detection.frame_index] = detection
 
     return sorted(merged.values(), key=lambda detection: detection.frame_index)
 
 
-def evaluate_track_detections(detections, truck_model, size_model, truck_classes, size_classes, device):
+def evaluate_track_detections(video_path, detections, truck_model, size_model, truck_classes, size_classes, device):
     for detection in detections:
-        frame = cv2.imread(str(detection.image_path))
+        frame = load_frame_at(video_path, detection.frame_index)
         if frame is None:
             detection.fill_percentage = None
-            detection.raw_output = "Error loading image"
+            detection.raw_output = f"Error loading frame {detection.frame_index}"
             detection.fill_status = "failed"
             continue
 
@@ -491,8 +506,7 @@ def analyze_video(video_path, output_dir, sampling_fps, show_preview, device, tr
         for track_id, detection_index in matches:
             bbox, confidence, score = detections[detection_index]
             track = active_tracks[track_id]
-            image_path = save_frame(output_dir, track_id, frame_index, frame)
-            detection = Detection(bbox, confidence, score, frame_index, timestamp_sec, image_path)
+            detection = Detection(bbox, confidence, score, frame_index, timestamp_sec)
             track.bbox = bbox
             track.hits += 1
             track.missed = 0
@@ -509,8 +523,7 @@ def analyze_video(video_path, output_dir, sampling_fps, show_preview, device, tr
 
         for detection_index in unmatched_detection_ids:
             bbox, confidence, score = detections[detection_index]
-            image_path = save_frame(output_dir, next_track_id, frame_index, frame)
-            detection = Detection(bbox, confidence, score, frame_index, timestamp_sec, image_path)
+            detection = Detection(bbox, confidence, score, frame_index, timestamp_sec)
             active_tracks[next_track_id] = Track(
                 track_id=next_track_id,
                 bbox=bbox,
@@ -579,15 +592,15 @@ def write_all_frames_fill_csv(output_dir, completed_tracks):
         writer.writeheader()
 
         for track in sorted(completed_tracks, key=lambda item: item.track_id):
-            best_frame_path = str(track.best_detection.image_path)
+            best_frame_path = "" if track.best_detection.image_path is None else str(track.best_detection.image_path)
             for detection in sorted(track.history, key=lambda item: item.frame_index):
                 writer.writerow(
                     {
                         "truck_id": track.track_id,
                         "frame_index": detection.frame_index,
                         "timestamp_sec": f"{detection.timestamp_sec:.2f}",
-                        "frame_path": str(detection.image_path),
-                        "is_selected_frame": "yes" if str(detection.image_path) == best_frame_path else "no",
+                        "frame_path": "" if detection.image_path is None else str(detection.image_path),
+                        "is_selected_frame": "yes" if detection.frame_index == track.best_detection.frame_index else "no",
                         "fill_percentage": "" if detection.fill_percentage is None else f"{detection.fill_percentage:.2f}",
                         "status": detection.fill_status,
                     }
@@ -626,6 +639,7 @@ def main():
     for track in completed_tracks:
         candidate_detections = select_fill_candidates(track)
         evaluate_track_detections(
+            video_path,
             candidate_detections,
             truck_model,
             size_model,
@@ -637,6 +651,9 @@ def main():
 
     for track in sorted(completed_tracks, key=lambda item: item.track_id):
         best = track.best_detection
+        best_frame = load_frame_at(video_path, best.frame_index)
+        if best_frame is not None:
+            best.image_path = save_frame(output_dir, track.track_id, best.frame_index, best_frame)
         fill_percentage = best.fill_percentage
         raw_output = best.raw_output
         status = best.fill_status
@@ -645,14 +662,14 @@ def main():
                 "truck_id": track.track_id,
                 "frame_index": best.frame_index,
                 "timestamp_sec": f"{best.timestamp_sec:.2f}",
-                "selected_frame": str(best.image_path),
+                "selected_frame": "" if best.image_path is None else str(best.image_path),
                 "fill_percentage": "" if fill_percentage is None else f"{fill_percentage:.2f}",
                 "status": status,
             }
         )
 
         print("##########################")
-        print(f"Selected truck frame: {best.image_path}")
+        print(f"Selected truck frame: {best.image_path}" if best.image_path is not None else f"Selected truck frame index: {best.frame_index}")
         print(f"Fill level: {fill_percentage:.2f}%" if fill_percentage is not None else "Fill level: N/A")
 
         log_path = output_dir / f"truck_{track.track_id:03d}_fill_output.txt"
@@ -668,6 +685,7 @@ def main():
         for track in completed_tracks:
             unevaluated = [detection for detection in track.history if detection.fill_status == "pending"]
             evaluate_track_detections(
+                video_path,
                 unevaluated,
                 truck_model,
                 size_model,
