@@ -77,6 +77,19 @@ def parse_args():
         action="store_true",
         help="Write the selected-frame summary CSV",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Inference device: auto, cpu, cuda, or cuda:0",
+    )
+    parser.add_argument(
+        "--save-frames",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Save selected frame images. Default 0 keeps edge runs storage-light.",
+    )
     return parser.parse_args()
 
 
@@ -467,8 +480,17 @@ def select_best_detection(track):
     return max(track.history, key=lambda detection: detection.score)
 
 
-def load_models():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def resolve_device(device_preference):
+    requested = str(device_preference or "auto").strip().lower()
+    if requested in {"", "auto"}:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        return "cpu"
+    return requested
+
+
+def load_models(device_preference="auto"):
+    device = resolve_device(device_preference)
     truck_model = YOLO(str(TRUCK_MODEL_PATH))
     size_model = YOLO(str(SIZE_MODEL_PATH))
     truck_classes = truck_model.names
@@ -618,7 +640,8 @@ def main():
     output_dir = args.output_dir or (BASE_DIR / "auto_outputs" / video_path.stem)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    device, truck_model, size_model, truck_classes, size_classes = load_models()
+    save_frames = bool(args.save_frames)
+    device, truck_model, size_model, truck_classes, size_classes = load_models(args.device)
     completed_tracks = analyze_video(
         video_path,
         output_dir,
@@ -652,7 +675,7 @@ def main():
     for track in sorted(completed_tracks, key=lambda item: item.track_id):
         best = track.best_detection
         best_frame = load_frame_at(video_path, best.frame_index)
-        if best_frame is not None:
+        if save_frames and best_frame is not None:
             best.image_path = save_frame(output_dir, track.track_id, best.frame_index, best_frame)
         fill_percentage = best.fill_percentage
         raw_output = best.raw_output
